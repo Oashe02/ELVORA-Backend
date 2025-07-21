@@ -23,9 +23,8 @@ const OrderSchema = new Schema(
                 },
                 name: { type: String, required: true },
                 sku: { type: String },
-                variant: {
-                    name: { type: String },
-                    attributes: { type: Map, of: String },
+                variantId: { // The specific variant ID
+                    type: mongoose.Schema.Types.ObjectId,
                 },
                 price: { type: Number, required: true },
                 originalPrice: { type: Number },

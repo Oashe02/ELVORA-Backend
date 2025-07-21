@@ -4,6 +4,8 @@ import Product from "../model/Product.js";
 import User from "../model/User.js";
 import Profile from "../model/Profile.js";
 import Settings from "../model/Settings.js";
+import AddOnProduct from "../model/AddOnProduct.js";
+
 
 import { generateOrderId } from "../utils/googleMerchant/order-utils.js";
 import { calculateDiscount } from "../utils/func.js";
@@ -86,35 +88,65 @@ export const createOrder = async (req, res) => {
 
         // fetch products
         const productIds = frontendProducts.map((i) => i._id || i.product);
-        const products = await Product.find({
-            _id: { $in: productIds },
-        }).lean();
-        if (products.length !== frontendProducts.length) {
-            return res.status(400).json({ error: "Some products not found" });
+        const uniqueProductIds = [...new Set(productIds.map((id) => id.toString()))];
+        
+        const products = await Product.find({ _id: { $in: uniqueProductIds } }).lean();
+        
+        if (products.length !== uniqueProductIds.length) {
+          return res.status(400).json({ error: "Some products not found" });
         }
+        
         const productMap = new Map(products.map((p) => [p._id.toString(), p]));
 
         // build orderProducts & subtotal
         let orderSubtotal = 0;
-        const orderProducts = products.map((i) => {
-            const prod = productMap.get(i._id?.toString() || i.productId);
-            const qty = i.quantity || 1;
-            const price = prod.price || 0;
-            const orig = prod.mrp || price;
-            const sub = price * qty;
-            orderSubtotal += sub;
+        const orderProducts = frontendProducts.map((item) => {
+            const productId = item._id || item.product;
+            const variantId = item.variantId;
+            const quantity = item.quantity || 1;
+        
+            const dbProduct = productMap.get(productId.toString());
+
+if (!dbProduct) {
+    console.warn("Missing product:", productId);
+    throw new Error(`Product with ID ${productId} not found`);
+}
+            let price, originalPrice, sku;
+        
+            if (variantId) {
+                const variant = dbProduct.variants.find(
+                    (v) => v._id.toString() === variantId.toString()
+                );
+                if (!variant) {
+                    throw new Error(
+                        `Variant ${variantId} not found in product ${dbProduct.name}`
+                    );
+                }
+                price = variant.price;
+                originalPrice = variant.mrp || variant.price;
+                sku = dbProduct.sku; // Or generate variant-specific SKU if needed
+            } else {
+                price = dbProduct.price;
+                originalPrice = dbProduct.mrp || price;
+                sku = dbProduct.sku;
+            }
+        
+            const subtotal = price * quantity;
+            orderSubtotal += subtotal;
+        
             return {
-                ...prod,
-                product: prod._id,
-                name: prod.name,
-                sku: prod.sku,
+                product: dbProduct._id,
+                variantId: variantId || undefined,
+                name: dbProduct.name,
+                sku,
                 price,
-                originalPrice: orig,
-                quantity: qty,
-                subtotal: sub,
+                originalPrice,
+                quantity,
+                subtotal,
                 fulfillmentStatus: "pending",
             };
         });
+        
 
         // user/profile handling
         // let user = await getUserFromRequest(req);
@@ -438,9 +470,10 @@ export const createOrder = async (req, res) => {
     //     return res.status(400).json({ success: false, error: err.message });
     // }
 };
+
+
 export const getOrderSummary = async (req, res) => {
     try {
-        const body = req.body;
         const {
             products: frontendProducts,
             couponCode,
@@ -460,19 +493,37 @@ export const getOrderSummary = async (req, res) => {
             });
         }
 
-        // Fetch products from database
+        // Fetch product IDs from the frontend request
         const productIds = frontendProducts.map((i) => i._id || i.product);
-        const products = await Product.find({
-            _id: { $in: productIds },
-        }).lean();
 
-        if (products.length !== frontendProducts.length) {
+        // --- FIX: Fetch from both Product and AddOnProduct collections ---
+        const [regularProducts, addonProducts] = await Promise.all([
+            Product.find({ _id: { $in: productIds } }).lean(),
+            AddOnProduct.find({ _id: { $in: productIds } }).lean()
+        ]);
+
+        // Combine the results from both collections
+        const allAvailableProducts = [...regularProducts, ...addonProducts];
+        const productMap = new Map(allAvailableProducts.map((p) => [p._id.toString(), p]));
+
+        // --- FIX: Robust product validation ---
+        const allProductsExist = frontendProducts.every(item => {
+            const productId = item._id || item.product;
+            return productMap.has(productId.toString());
+        });
+
+        if (!allProductsExist) {
+            const notFoundIds = frontendProducts
+                .filter(item => !productMap.has((item._id || item.product).toString()))
+                .map(item => item._id || item.product);
+            console.error("The following product IDs were not found in the database:", notFoundIds);
+            
             return res.status(400).json({
                 error: "Some products not found",
+                details: `Could not find products with IDs: ${notFoundIds.join(', ')}`
             });
         }
 
-        const productMap = new Map(products.map((p) => [p._id.toString(), p]));
 
         // Build order products and calculate subtotal
         let orderSubtotal = 0;
@@ -481,18 +532,40 @@ export const getOrderSummary = async (req, res) => {
             const dbProduct = productMap.get(productId.toString());
 
             if (!dbProduct) {
-                throw new Error(`Product ${productId} not found`);
+                throw new Error(`Product ${productId} not found during cart processing.`);
             }
 
+            let price;
+            let originalPrice;
             const quantity = frontendItem.quantity || 1;
-            const price = dbProduct.price || 0;
-            const originalPrice = dbProduct.mrp || price;
-            const subtotal = price * quantity;
 
+            // --- FIX: Handle product variants by matching price ---
+            // This is more robust if variantId is not sent from the frontend.
+            let foundVariant = false;
+            if (dbProduct.variants && dbProduct.variants.length > 0) {
+                // Find the variant that matches the price from the cart item
+                const variant = dbProduct.variants.find(v => v.price === frontendItem.price);
+                
+                if (variant) {
+                    price = variant.price;
+                    originalPrice = variant.mrp || variant.price;
+                    foundVariant = true;
+                }
+            }
+            
+            // If no matching variant was found, use the base product price
+            if (!foundVariant) {
+                price = dbProduct.price || 0;
+                originalPrice = dbProduct.mrp || price;
+            }
+
+            const subtotal = price * quantity;
             orderSubtotal += subtotal;
 
             return {
                 _id: dbProduct._id,
+                // Include variantId if it exists on the frontend item, for consistency
+                variantId: frontendItem.variantId, 
                 name: dbProduct.name,
                 sku: dbProduct.sku,
                 price,
@@ -608,9 +681,12 @@ export const getOrderSummary = async (req, res) => {
         return res.status(500).json({
             success: false,
             error: "Failed to calculate order summary",
+            message: error.message
         });
     }
 };
+
+
 export const orderFullfill = async (req, res) => {
     const { orderId } = req.body;
 
